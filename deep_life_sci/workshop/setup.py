@@ -22,7 +22,9 @@ It creates, in that workspace:
    filter scores every child run, about thirty per trace).
 3. **Review queue** `drug-research-review` and two rules that send a root run to it when a
    scientist rated it down (`user_rating` 0) or the citation judge failed it
-   (`cites_sources` 0).
+   (`cites_sources` 0). The workspace gets feedback tags `user_rating` and `correct` (0 to
+   1), so a rating can be left from a trace's Add feedback menu before any exist, and the
+   queue asks its reviewer for a `correct` score as well as a note.
 4. **Saved traces** (`traces.py`) replayed into the project, once: a re-run skips them if
    the project already has runs tagged `saved-trace`.
 
@@ -53,19 +55,22 @@ REASONING = (
 )
 _FINAL = (
     "You are checking a drug development research assistant's final answer. The input is "
-    "the full agent state; look only at the final assistant message to the user.\n\n"
+    "the full agent state; look only at the final assistant message to the user. If the "
+    "state ends with an assistant message that only requests a tool call, the run paused "
+    "for a person's approval and has no answer yet: score 1 and say so in the comment.\n\n"
 )
 JUDGES = [
     {
         "key": "cites_sources",
         "prompt": _FINAL + (
-            "Score 1 if every specific finding attributed to a particular study or trial (a "
-            "result, an effect size, a cohort size, a primary endpoint, a trial status) has "
-            "an identifier for that study in the same row, sentence or paragraph: a PMID, "
-            "PMCID, NCT number, DOI, or a link to PubMed, PMC, ClinicalTrials.gov or the web "
-            "page it came from. Summary statements across several studies and statements "
-            "that no data was found do not need one. Score 0 if a study-specific finding has "
-            "no identifier near it."
+            "Score 1 if every study or trial that the answer reports a specific finding from "
+            "(a result, an effect size, a cohort size, a primary endpoint, a trial status) "
+            "is identified somewhere in the answer: a PMID, PMCID, NCT number, DOI, or a "
+            "link to PubMed, PMC, ClinicalTrials.gov or the web page it came from. A study "
+            "identified once can be mentioned again without its identifier. Summary "
+            "statements across several studies and statements that no data was found do "
+            "not need one. Score 0 if the answer reports a specific finding from a study or "
+            "trial that it never identifies."
         ),
     },
     {
@@ -90,6 +95,13 @@ QUEUE_RULES = [
     ("Scientist rated it down", "user_rating"),
     ("Citation check failed", "cites_sources"),
 ]
+# Feedback tags made in the workspace so people can pick them on a trace or in the queue.
+SCORE_0_TO_1 = {"type": "continuous", "min": 0, "max": 1}
+FEEDBACK_TAGS = (traces.RATING_KEY, "correct")
+QUEUE_RUBRIC = [{
+    "feedback_key": "correct",
+    "description": "1 if the answer is right and can be traced to its sources, 0 if not.",
+}]
 
 
 class SetupError(RuntimeError):
@@ -190,6 +202,20 @@ def _project_id(client, project: str) -> str:
         return str(client.create_project(project_name=project).id)
 
 
+def setup_feedback_tags(client, *, log=print) -> None:
+    """Workspace feedback tags for the ratings people leave. A tag that already exists
+    with a different scale is left as it is."""
+    from langsmith.utils import LangSmithError
+
+    for key in FEEDBACK_TAGS:
+        try:
+            client.request_with_retries("POST", "/feedback-configs", request_kwargs={"json": {
+                "feedback_key": key, "feedback_config": SCORE_0_TO_1,
+                "is_lower_score_better": False}})
+        except LangSmithError as exc:
+            log(f"Feedback tag {key}: kept as it is ({type(exc).__name__})")
+
+
 def setup_rules(client, project_id: str, *, log=print) -> dict:
     ours = {j["key"] for j in JUDGES} | {name for name, _ in QUEUE_RULES}
     existing = _call(client, "GET", "/runs/rules", params={"session_id": project_id}).json()
@@ -228,6 +254,7 @@ def setup_rules(client, project_id: str, *, log=print) -> dict:
         })
     log(f"Judges: {', '.join(j['key'] for j in JUDGES)} on root runs of the agent")
 
+    setup_feedback_tags(client, log=log)
     queues = _call(client, "GET", "/annotation-queues", params={"name": QUEUE}).json()
     queue = next((q for q in queues if q.get("name") == QUEUE), None)
     if queue is None:
@@ -237,9 +264,13 @@ def setup_rules(client, project_id: str, *, log=print) -> dict:
             "rubric_instructions": (
                 "Read the question and the final answer. Check two or three of the studies "
                 "or trials it relies on. Score correct 1 if the answer is right and can be "
-                "traced to its sources, 0 if not, and say what is wrong in the comment."
+                "traced to its sources, 0 if not, and say what is wrong in the note."
             ),
+            "rubric_items": QUEUE_RUBRIC,
         }).json()
+    else:
+        _call(client, "PATCH", f"/annotation-queues/{queue['id']}",
+              json={"rubric_items": QUEUE_RUBRIC})
     for name, key in QUEUE_RULES:
         _call(client, "POST", "/runs/rules", json={
             "display_name": name,

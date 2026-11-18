@@ -248,13 +248,18 @@ def test_context_hub_instructions_outrank_the_skills_on_citations():
 class _Client:
     """Records LangSmith API calls; answers the handful setup reads."""
 
-    def __init__(self, rules=(), queues=()):
+    def __init__(self, rules=(), queues=(), tags_exist=False):
         self.calls: list[tuple[str, str, dict]] = []
         self._rules = list(rules)
         self._queues = list(queues)
+        self._tags_exist = tags_exist
 
     def request_with_retries(self, method, path, request_kwargs=None):
+        from langsmith.utils import LangSmithError
+
         self.calls.append((method, path, request_kwargs or {}))
+        if (method, path) == ("POST", "/feedback-configs") and self._tags_exist:
+            raise LangSmithError("400 a different config exists")
         body = None
         if (method, path) == ("GET", "/runs/rules"):
             body = self._rules
@@ -286,6 +291,47 @@ def test_rules_score_and_route_only_agent_root_runs(monkeypatch):
         True, False}
     assert all(q["add_to_annotation_queue_id"] == "q1" for q in queue_rules)
     assert "placeholder" not in str(judges)
+
+
+def test_a_paused_run_passes_every_judge():
+    # A run that stops for web search approval is its own trace with no answer in it.
+    for judge in setup.JUDGES:
+        assert "paused" in judge["prompt"] and "score 1" in judge["prompt"]
+
+
+def test_a_study_cited_once_can_be_mentioned_again():
+    # On 18 Nov a fixed answer cited ORION-9 in a table, then failed for a later sentence
+    # about ORION-9 with no identifier beside it.
+    prompt = next(j["prompt"] for j in setup.JUDGES if j["key"] == "cites_sources")
+    assert "identified once can be mentioned again" in prompt
+    assert "same row" not in prompt and "near it" not in prompt
+
+
+def test_rating_tags_exist_and_the_queue_asks_for_a_score(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "placeholder")
+    client = _Client()
+    setup.setup_rules(client, "p1", log=lambda _: None)
+    tags = [kw["json"] for method, path, kw in client.calls
+            if (method, path) == ("POST", "/feedback-configs")]
+    assert [t["feedback_key"] for t in tags] == ["user_rating", "correct"]
+    assert all(t["feedback_config"] == {"type": "continuous", "min": 0, "max": 1}
+               for t in tags)
+    created = next(kw["json"] for method, path, kw in client.calls
+                   if (method, path) == ("POST", "/annotation-queues"))
+    assert [r["feedback_key"] for r in created["rubric_items"]] == ["correct"]
+
+
+def test_an_existing_queue_gets_the_score_and_existing_tags_are_kept(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "placeholder")
+    client = _Client(queues=[{"id": "q9", "name": setup.QUEUE}], tags_exist=True)
+    notes: list[str] = []
+    setup.setup_rules(client, "p1", log=notes.append)
+    patched = [kw["json"] for method, path, kw in client.calls
+               if (method, path) == ("PATCH", "/annotation-queues/q9")]
+    assert patched == [{"rubric_items": setup.QUEUE_RUBRIC}]
+    assert not any(path == "/annotation-queues" and method == "POST"
+                   for method, path, _ in client.calls)
+    assert sum("kept as it is" in n for n in notes) == 2
 
 
 def test_existing_instructions_are_kept_unless_reset():
