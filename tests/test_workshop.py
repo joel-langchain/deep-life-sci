@@ -463,3 +463,75 @@ async def test_tools_called_from_eval_are_runs_in_the_same_trace(monkeypatch, mo
     assert {"eval", "pubmed_search"} <= set(by_name)
     assert len({str(run["trace_id"]) for run in posted}) == 1
     assert by_name["pubmed_search"]["parent_run_id"] == by_name["eval"]["id"]
+
+
+def test_capture_keeps_answered_agent_traces_only(tmp_path):
+    import json
+    from datetime import datetime
+
+    def root(name, trace_id, content, tool_calls=None):
+        message = {"type": "ai", "content": content, "tool_calls": tool_calls or []}
+        return SimpleNamespace(name=name, trace_id=trace_id,
+                               outputs={"messages": [message]})
+
+    roots = [
+        root("agent", "t1", "Three trials found."),
+        root("agent", "t2", "", [{"name": "web_search"}]),  # paused for approval
+        root("agent_staging", "t3", "Cited PMID 1."),
+        root("setup", "t4", "Done."),
+        root("agent", "t5", "Two papers found."),
+    ]
+
+    class Client:
+        def __init__(self):
+            self.root_kwargs = None
+
+        def read_project(self, project_name):
+            return SimpleNamespace(id="p1")
+
+        def list_runs(self, project_id, is_root=None, trace_id=None, start_time=None):
+            if is_root:
+                self.root_kwargs = {"start_time": start_time}
+                return iter(roots)
+            return [SimpleNamespace(model_dump_json=lambda t=trace_id: json.dumps(
+                {"id": f"{t}-run", "trace_id": t, "parent_run_id": None}))]
+
+        def list_feedback(self, run_ids):
+            return []
+
+    client = Client()
+    since = datetime(2026, 11, 18, 18, 0)
+    out = tmp_path / "saved.json.gz"
+    assert traces.capture(client, "p", out=out, limit_traces=40, since=since) == 2
+    assert client.root_kwargs == {"start_time": since}
+    assert {run["trace_id"] for run in traces.load_saved(out)} == {"t1", "t5"}
+
+
+def test_replayed_traces_name_the_workspaces_own_commit():
+    extra = {"metadata": {"context_hub_commit": "reference", "context_hub_tag": "production"}}
+    assert traces._with_commit(extra, "attendee") == {
+        "metadata": {"context_hub_commit": "attendee", "context_hub_tag": "production"}}
+    assert traces._with_commit(extra, None) is extra
+    assert traces._with_commit({"metadata": {"other": 1}}, "attendee") == {
+        "metadata": {"other": 1}}
+    assert extra["metadata"]["context_hub_commit"] == "reference"
+
+
+@pytest.mark.parametrize("seeded, expected", [(True, "abc123"), (False, None)])
+def test_setup_passes_the_seeded_commit_to_the_replay(monkeypatch, seeded, expected):
+    import langsmith
+
+    passed = {}
+    monkeypatch.setattr(langsmith, "Client", lambda: Mock())
+    monkeypatch.setattr(setup, "_project_id", lambda client, project: "p1")
+    monkeypatch.setattr(setup, "setup_context_hub", lambda client, reset, log: {
+        "repo": "r", "tag": "production", "commit": "abc123", "seeded": seeded})
+    monkeypatch.setattr(setup, "setup_rules", lambda client, project_id, log: {})
+
+    def fake_traces(client, project, project_id, *, commit=None, log=print):
+        passed["commit"] = commit
+        return {}
+
+    monkeypatch.setattr(setup, "setup_traces", fake_traces)
+    setup.run_setup("p", log=lambda _: None)
+    assert passed["commit"] == expected

@@ -288,7 +288,8 @@ def setup_rules(client, project_id: str, *, log=print) -> dict:
 
 # --- 4. Saved traces ---------------------------------------------------------------------
 
-def setup_traces(client, project: str, project_id: str, *, log=print) -> dict:
+def setup_traces(client, project: str, project_id: str, *, commit: str | None = None,
+                 log=print) -> dict:
     if not traces.SAVED.exists():
         # A build made before the traces were captured. Everything else still works;
         # Engine and the judges just start from the room's own chats.
@@ -300,7 +301,7 @@ def setup_traces(client, project: str, project_id: str, *, log=print) -> dict:
     if already:
         log("Saved traces: already in the project, not uploaded again")
         return {"skipped": True}
-    return traces.upload(client, project, tag=SAVED_TAG, log=log)
+    return traces.upload(client, project, tag=SAVED_TAG, commit=commit, log=log)
 
 
 # --- all of it ---------------------------------------------------------------------------
@@ -316,7 +317,13 @@ def run_setup(project: str, *, reset_instructions: bool = False, replay_traces: 
     result["context_hub"] = setup_context_hub(client, reset=reset_instructions, log=log)
     result["rules"] = setup_rules(client, project_id, log=log)
     if replay_traces:
-        result["traces"] = setup_traces(client, project, project_id, log=log)
+        # The replayed answers were written by the bundled text, so they name this
+        # workspace's commit of it, which is the production commit unless a re-run kept
+        # an edited repo; then the seeded commit is unknown here and they keep their own.
+        hub = result["context_hub"]
+        result["traces"] = setup_traces(
+            client, project, project_id, log=log,
+            commit=hub["commit"] if hub["seeded"] else None)
     log("Done. Judges score the saved traces over the next few minutes.")
     return result
 

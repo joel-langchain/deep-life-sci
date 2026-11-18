@@ -32,6 +32,10 @@ SAVED = Path(__file__).resolve().parent / "saved_traces.json.gz"
 
 MAX_BACKDATE_DAYS = 0.9
 RATING_KEY = "user_rating"
+# The agent graph's root run name on Agent Server, the runs the judges score.
+ROOT_NAME = "agent"
+# Trace metadata naming the Context Hub version that wrote an answer (`graph.py`).
+COMMIT_KEY = "context_hub_commit"
 
 # Identifiers a scientist would look for to check an answer.
 _CITATION = re.compile(r"\b(PMID|NCT\d{8}|pubmed\.ncbi|clinicaltrials\.gov/study|doi\.org)", re.I)
@@ -86,16 +90,28 @@ def rate(root: dict, rng: random.Random) -> tuple[int, str | None] | None:
 
 # --- capture -----------------------------------------------------------------------------
 
-def capture(client, project: str, out: Path = SAVED, limit_traces: int = 40) -> int:
-    """Save every run of the last `limit_traces` root traces in `project`, with feedback."""
+def capture(client, project: str, out: Path = SAVED, limit_traces: int = 40,
+            since: datetime | None = None) -> int:
+    """Save every run of the last `limit_traces` answered `agent` traces in `project`.
+
+    Only root runs named `agent` with a final answer are kept: `setup` and `agent_staging`
+    runs are not what the judges score, and a run paused for web search approval has no
+    answer (its resume is a trace of its own and is kept). `since` drops anything older,
+    so test runs made before the capture session stay out.
+    """
     from langsmith.utils import LangSmithNotFoundError
 
     try:
         project_id = client.read_project(project_name=project).id
     except LangSmithNotFoundError:
         sys.exit(f"project {project!r} not found")
-    roots = [r for r in client.list_runs(project_id=project_id, is_root=True, limit=limit_traces)
-             if r.name != "setup"]
+    roots = []
+    for root in client.list_runs(project_id=project_id, is_root=True, start_time=since):
+        if root.name != ROOT_NAME or not final_answer({"outputs": root.outputs}):
+            continue
+        roots.append(root)
+        if len(roots) == limit_traces:
+            break
     runs = []
     for root in roots:
         for run in client.list_runs(project_id=project_id, trace_id=root.trace_id):
@@ -145,9 +161,26 @@ def load_saved(path: Path = SAVED) -> list[dict]:
         return json.load(fh)
 
 
+def _with_commit(extra: dict, commit: str | None) -> dict:
+    """`extra` with its Context Hub commit replaced by `commit`, when both exist.
+
+    The saved traces were written by the reference workspace's first commit, which does not
+    exist in an attendee's repo. Their own first commit holds the same text, so replayed
+    traces name that one, and the trace, Context Hub, and Engine agree on the version.
+    """
+    metadata = extra.get("metadata")
+    if not commit or not isinstance(metadata, dict) or COMMIT_KEY not in metadata:
+        return extra
+    return {**extra, "metadata": {**metadata, COMMIT_KEY: commit}}
+
+
 def upload(client, project: str, *, seed: int | None = None, tag: str | None = None,
-           log=print) -> dict:
-    """Replay the saved traces into `project`. Returns counts, after checking they landed."""
+           commit: str | None = None, log=print) -> dict:
+    """Replay the saved traces into `project`. Returns counts, after checking they landed.
+
+    `commit` is the workspace's own Context Hub commit for the bundled instructions; see
+    `_with_commit`.
+    """
     from langsmith import uuid7
 
     rng = random.Random(seed)
@@ -177,7 +210,7 @@ def upload(client, project: str, *, seed: int | None = None, tag: str | None = N
             "inputs": run.get("inputs") or {},
             "outputs": run.get("outputs"),
             "error": run.get("error"),
-            "extra": run.get("extra") or {},
+            "extra": _with_commit(run.get("extra") or {}, commit),
             "tags": [*(run.get("tags") or []),
                      *([tag] if tag and not run.get("parent_run_id") else [])] or None,
             "start_time": _parse(run["start_time"]),
@@ -259,10 +292,12 @@ def main() -> int:
     parser.add_argument("action", choices=["capture", "upload"])
     parser.add_argument("--project", required=True)
     parser.add_argument("--limit", type=int, default=40, help="capture: root traces to keep")
+    parser.add_argument("--since", type=datetime.fromisoformat, default=None,
+                        help="capture: only traces started at or after this ISO time")
     args = parser.parse_args()
     client = Client()
     if args.action == "capture":
-        capture(client, args.project, limit_traces=args.limit)
+        capture(client, args.project, limit_traces=args.limit, since=args.since)
     else:
         upload(client, args.project)
     return 0
