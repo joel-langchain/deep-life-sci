@@ -290,7 +290,11 @@ class TestTheSkillsLoad:
 
         config = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         assert config["tool"]["setuptools"]["package-data"]["deep_life_sci"] == [
-            "skills/*/SKILL.md"
+            "skills/*/SKILL.md",
+            # Workshop mode reads these at run time: the fallback instructions and the
+            # traces its setup graph replays.
+            "workshop/context/AGENTS.md",
+            "workshop/saved_traces.json.gz",
         ]
 
 

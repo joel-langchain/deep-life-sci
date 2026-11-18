@@ -1,0 +1,16 @@
+{
+  "python_version": "3.12",
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./deep_life_sci/workshop/graph.py:make_graph",
+    "agent_staging": "./deep_life_sci/workshop/graph.py:make_staging_graph",
+    "setup": "./deep_life_sci/workshop/setup.py:graph"
+  },
+  "checkpointer": {
+    "ttl": {
+      "strategy": "delete",
+      "default_ttl": 10080,
+      "sweep_interval_minutes": 60
+    }
+  }
+}

@@ -112,11 +112,17 @@ packages = [
     "deep_life_sci.middleware",
     "deep_life_sci.prompts",
     "deep_life_sci.sources",
+    "deep_life_sci.workshop",
 ]
 
 # The root agent's skills are Markdown inside the package (`paths.SKILLS_DIR`).
 [tool.setuptools.package-data]
-deep_life_sci = ["skills/*/SKILL.md"]
+deep_life_sci = [
+    "skills/*/SKILL.md",
+    # Workshop mode: the bundled Context Hub instructions and the saved traces it replays.
+    "workshop/context/AGENTS.md",
+    "workshop/saved_traces.json.gz",
+]
 
 [tool.ruff]
 line-length = 100
