@@ -507,6 +507,40 @@ def test_capture_keeps_answered_agent_traces_only(tmp_path):
     assert {run["trace_id"] for run in traces.load_saved(out)} == {"t1", "t5"}
 
 
+def test_prune_drops_middleware_spans_and_reattaches_their_children():
+    def run(id_, name, parent):
+        return {"id": id_, "trace_id": "t", "name": name, "parent_run_id": parent}
+
+    runs = [
+        run("r", "agent", None),
+        run("m", "model", "r"),
+        run("h1", "FilesystemMiddleware.awrap_model_call", "m"),
+        run("h2", "SurfaceModelErrors.awrap_model_call", "h1"),
+        run("llm", "ChatOpenAI", "h2"),
+        run("b", "SkillsMiddleware.before_model", "r"),
+        run("t", "tools", "r"),
+        run("h3", "HumanInTheLoopMiddleware.awrap_tool_call", "t"),
+        run("w", "web_search", "h3"),
+        run("a", "CodeInterpreterMiddleware.after_agent", "r"),
+    ]
+    kept = {r["id"]: r["parent_run_id"] for r in traces.prune(runs)}
+    assert kept == {"r": None, "m": "r", "llm": "m", "t": "r", "w": "t"}
+    # A root keeps its place even if its name looked like a hook.
+    assert traces.prune([run("x", "Odd.before_agent", None)])[0]["id"] == "x"
+
+
+def test_prune_drops_the_source_workspaces_ids_from_metadata():
+    metadata = {"LANGSMITH_TENANT_ID": "ws", "user_id": "u", "langgraph_api_url": "https://x",
+                "context_hub_commit": "c", "context_hub_tag": "production", "graph_id": "agent"}
+    run = {"id": "r", "trace_id": "r", "name": "agent", "parent_run_id": None,
+           "extra": {"metadata": metadata, "runtime": {"sdk": "py"}}}
+    (kept,) = traces.prune([run])
+    kept_metadata = {
+        "context_hub_commit": "c", "context_hub_tag": "production", "graph_id": "agent"}
+    assert kept["extra"] == {"metadata": kept_metadata, "runtime": {"sdk": "py"}}
+    assert run["extra"]["metadata"]["user_id"] == "u"  # the input is not changed
+
+
 def test_replayed_traces_name_the_workspaces_own_commit():
     extra = {"metadata": {"context_hub_commit": "reference", "context_hub_tag": "production"}}
     assert traces._with_commit(extra, "attendee") == {

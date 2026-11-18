@@ -37,6 +37,20 @@ ROOT_NAME = "agent"
 # Trace metadata naming the Context Hub version that wrote an answer (`graph.py`).
 COMMIT_KEY = "context_hub_commit"
 
+# Middleware hook spans (`SkillsMiddleware.before_model`, `SurfaceModelErrors.awrap_model_call`,
+# ...). Each carries the whole agent state, so they made up most of a captured trace's size
+# (one `after_agent` span was about 2 MB) while adding nothing Engine reads.
+_HOOK_SPAN = re.compile(r"\.(a?wrap_(model|tool)_call|before_(agent|model)|after_(agent|model))$")
+
+# Trace metadata naming the source workspace, its user, and its deployment. Meaningless in
+# an attendee's workspace, and the saved file lives in a public repo.
+_SOURCE_METADATA = frozenset({
+    "LANGSMITH_TENANT_ID", "LANGSMITH_HOST_PROJECT_ID", "LANGSMITH_HOST_PROJECT_NAME",
+    "LANGSMITH_HOST_REVISION_ID", "LANGSMITH_HOST_API_URL", "LANGSMITH_AUTH_ENDPOINT",
+    "LANGSMITH_LANGGRAPH_GIT_REF_SHA", "langgraph_api_url", "langgraph_host", "revision_id",
+    "user_id", "langgraph_auth_user_id", "assistant_id", "langgraph_request_id",
+})
+
 # Identifiers a scientist would look for to check an answer.
 _CITATION = re.compile(r"\b(PMID|NCT\d{8}|pubmed\.ncbi|clinicaltrials\.gov/study|doi\.org)", re.I)
 
@@ -90,6 +104,38 @@ def rate(root: dict, rng: random.Random) -> tuple[int, str | None] | None:
 
 # --- capture -----------------------------------------------------------------------------
 
+def prune(runs: list[dict]) -> list[dict]:
+    """`runs` without middleware hook spans, each child moved up to its nearest kept ancestor.
+
+    Root runs are always kept. The trace keeps the graph nodes, model calls, tools, and
+    subagents, which is what a reader or Engine follows. Source workspace ids are dropped
+    from the metadata (`_scrub`).
+    """
+    by_id = {str(r["id"]): r for r in runs}
+
+    def dropped(run: dict) -> bool:
+        return bool(run.get("parent_run_id")) and bool(_HOOK_SPAN.search(run.get("name") or ""))
+
+    kept = []
+    for run in runs:
+        if dropped(run):
+            continue
+        parent = by_id.get(str(run.get("parent_run_id")))
+        while parent is not None and dropped(parent):
+            parent = by_id.get(str(parent.get("parent_run_id")))
+        kept.append({**run, "parent_run_id": parent["id"] if parent else run.get("parent_run_id"),
+                     "extra": _scrub(run.get("extra") or {})})
+    return kept
+
+
+def _scrub(extra: dict) -> dict:
+    """`extra` without the metadata that names the source workspace (`_SOURCE_METADATA`)."""
+    metadata = extra.get("metadata")
+    if not isinstance(metadata, dict):
+        return extra
+    return {**extra, "metadata": {k: v for k, v in metadata.items() if k not in _SOURCE_METADATA}}
+
+
 def capture(client, project: str, out: Path = SAVED, limit_traces: int = 40,
             since: datetime | None = None) -> int:
     """Save every run of the last `limit_traces` answered `agent` traces in `project`.
@@ -117,6 +163,7 @@ def capture(client, project: str, out: Path = SAVED, limit_traces: int = 40,
         for run in client.list_runs(project_id=project_id, trace_id=root.trace_id):
             dump = getattr(run, "model_dump_json", None) or run.json
             runs.append(json.loads(dump()))
+    runs = prune(runs)
     feedback = defaultdict(list)
     for item in client.list_feedback(run_ids=[r["id"] for r in runs if not r.get("parent_run_id")]):
         feedback[str(item.run_id)].append(
