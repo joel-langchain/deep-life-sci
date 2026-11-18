@@ -312,22 +312,35 @@ def upload(client, project: str, *, seed: int | None = None, tag: str | None = N
         time.sleep(3)
 
     ratings = 0
-    for trace_runs in traces.values():
-        root = next(r for r in trace_runs if r["parent_run_id"] is None)
+    roots = [next(r for r in trace_runs if r["parent_run_id"] is None)
+             for trace_runs in traces.values()]
+    for root in roots:
         found = root["feedback"] or []
         if not found:
             rated = rate({"outputs": root["outputs"]}, rng)
             if rated:
                 found = [{"key": RATING_KEY, "score": rated[0], "comment": rated[1]}]
         for item in found:
+            # Feedback goes through the batch ingest, which rejects a time without a zone.
             client.create_feedback(run_id=root["id"], trace_id=root["trace_id"], key=RATING_KEY,
-                                   score=item.get("score"), comment=item.get("comment"))
+                                   score=item.get("score"), comment=item.get("comment"),
+                                   session_id=project_id,
+                                   start_time=root["start_time"].replace(tzinfo=UTC))
             ratings += 1
     client.flush()
+
+    # A rejected rating fails in the SDK's background thread, so count what arrived.
+    rated_landed = 0
+    for _ in range(10):
+        rated_landed = sum(1 for _ in client.list_feedback(
+            run_ids=[r["id"] for r in roots], feedback_key=[RATING_KEY]))
+        if rated_landed >= ratings:
+            break
+        time.sleep(3)
     result = {"traces": len(traces), "runs": len(expected), "landed": len(landed),
-              "ratings": ratings, "project": project, "project_id": str(project_id)}
+              "ratings": rated_landed, "project": project, "project_id": str(project_id)}
     log(f"saved traces: {len(traces)} traces, {len(landed)}/{len(expected)} runs landed, "
-        f"{ratings} ratings, in {project}")
+        f"{rated_landed}/{ratings} ratings landed, in {project}")
     return result
 
 
