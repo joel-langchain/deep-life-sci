@@ -297,6 +297,8 @@ def test_a_paused_run_passes_every_judge():
     # A run that stops for web search approval is its own trace with no answer in it.
     for judge in setup.JUDGES:
         assert "paused" in judge["prompt"] and "score 1" in judge["prompt"]
+    # The score field says it too: the judge follows the schema over the prompt.
+    assert "paused for approval, is 1" in setup.SCORE_FIELD
 
 
 def test_a_study_cited_once_can_be_mentioned_again():

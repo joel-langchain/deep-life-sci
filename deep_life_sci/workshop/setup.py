@@ -59,6 +59,8 @@ _FINAL = (
     "state ends with an assistant message that only requests a tool call, the run paused "
     "for a person's approval and has no answer yet: score 1 and say so in the comment.\n\n"
 )
+# On 18 Nov a judge wrote that a paused run scores 1, then set 0 from "1 = pass, 0 = fail".
+SCORE_FIELD = "1 = pass, 0 = fail. A run with no answer yet, paused for approval, is 1."
 JUDGES = [
     {
         "key": "cites_sources",
@@ -246,7 +248,7 @@ def setup_rules(client, project_id: str, *, log=print) -> dict:
                                     "description": "One or two sentences: what in the "
                                                    "answer drove this score."},
                         spec["key"]: {"type": "integer", "minimum": 0, "maximum": 1,
-                                      "description": "1 = pass, 0 = fail"},
+                                      "description": SCORE_FIELD},
                     },
                     "required": [spec["key"], "comment"],
                 },
