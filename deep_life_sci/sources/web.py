@@ -34,12 +34,17 @@ Two deliberate departures from its sibling modules:
 
 The two providers' block shapes differ and both are handled by `_digest`; the probe
 output they were written against is in the module's git history rather than a notes
-directory, since this surface has no API of its own to characterise.
+directory, since this surface has no API of its own to characterise. Each provider's
+blocks can also arrive in LangChain's standard form (`server_tool_call`,
+`server_tool_result`, and `citation` annotations) instead of its own, depending on the
+installed langchain-core and the message's output version. A deployment on 18 Nov 2026
+returned the standard form, so both forms are read everywhere a block type is matched.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import date
 from typing import Any
 
@@ -61,6 +66,10 @@ MAX_ANSWER_CHARS = 8_000
 # Sources actually cited, deduplicated by URL. Both providers cite far fewer than they
 # retrieve, which is the point — this is the attribution list, not the search log.
 MAX_SOURCES = 15
+
+# A markdown link in the digest, `[title](https://...)`. The search model often cites inline
+# this way and attaches an annotation to only one of the links, so these count as cited too.
+_MD_LINK = re.compile(r"\[([^\]]*)\]\((https?://[^\s)]+)\)")
 
 _PROMPT = """\
 Search the web and answer the question for a research scientist. Today is {today}.
@@ -128,6 +137,33 @@ def _answer(blocks: list[dict]) -> str:
     return "".join(b.get("text") or "" for b in blocks if b.get("type") == "text").strip()
 
 
+def _is_search_call(block: dict) -> bool:
+    """A web search the model ran, in the provider's own form or LangChain's standard one."""
+    kind = block.get("type")
+    if kind == "web_search_call":
+        return True
+    return kind in ("server_tool_use", "server_tool_call") and block.get("name") == "web_search"
+
+
+def _search_results(blocks: list[dict]) -> list[dict]:
+    """The result blocks that belong to a web search, in either form.
+
+    A standard `server_tool_result` names its call by `tool_call_id`, and Anthropic's also
+    keeps its original type in `extras.block_type`, so a result is matched by either.
+    """
+    call_ids = {b.get("id") for b in blocks if _is_search_call(b)}
+
+    def is_result(block: dict) -> bool:
+        if block.get("type") == "web_search_tool_result":
+            return True
+        return block.get("type") == "server_tool_result" and (
+            block.get("tool_call_id") in call_ids
+            or (block.get("extras") or {}).get("block_type") == "web_search_tool_result"
+        )
+
+    return [b for b in blocks if is_result(b)]
+
+
 def _sources(blocks: list[dict]) -> list[dict]:
     """The pages the answer is attributed to, deduplicated, in first-cited order.
 
@@ -150,15 +186,25 @@ def _sources(blocks: list[dict]) -> list[dict]:
 
     for block in blocks:
         if block.get("type") == "text":
+            # `annotations` holds OpenAI's `url_citation` and LangChain's standard `citation`
+            # alike; both carry `url` and `title`.
             for cite in (block.get("citations") or []) + (block.get("annotations") or []):
                 add(cite)
+    for block in blocks:
+        if block.get("type") == "text":
+            for title, url in _MD_LINK.findall(block.get("text") or ""):
+                add({"url": url, "title": title})
     if not found:
-        for block in blocks:
-            if block.get("type") == "web_search_tool_result":
-                # An *error* result puts a dict here where a list normally goes; `add`
-                # ignores the non-dict members that iterating one would yield.
-                for result in block.get("content") or []:
-                    add(result)
+        for block in _search_results(blocks):
+            # Anthropic's results are a list under `content` (`output` in the standard
+            # form); OpenAI's standard form puts them under `output.sources`. An *error*
+            # result puts a dict where a list normally goes; `add` ignores the non-dict
+            # members that iterating one would yield.
+            results = block.get("content") or block.get("output") or []
+            if isinstance(results, dict) and "sources" in results:
+                results = results["sources"] or []
+            for result in results:
+                add(result)
     return [{"url": u, "title": t} for u, t in list(found.items())[:MAX_SOURCES]]
 
 
@@ -172,14 +218,20 @@ def _searched(blocks: list[dict]) -> list[str]:
     """
     out: list[str] = []
     for block in blocks:
+        if not _is_search_call(block):
+            continue
         kind = block.get("type")
-        if kind == "server_tool_use" and block.get("name") == "web_search":
-            out.append((block.get("input") or {}).get("query") or "")
+        if kind == "server_tool_use":
+            details = block.get("input") or {}
         elif kind == "web_search_call":
-            action = block.get("action") or {}
-            out.extend(action.get("queries") or [action.get("query") or ""])
-            out.append(action.get("url") or "")
-    return list(dict.fromkeys(q for q in out if q))
+            details = block.get("action") or {}
+        else:
+            # LangChain's standard `server_tool_call`: Anthropic's input or OpenAI's action,
+            # moved under `args` unchanged.
+            details = block.get("args") or {}
+        out.extend(details.get("queries") or [details.get("query") or ""])
+        out.append(details.get("url") or "")
+    return list(dict.fromkeys(q for q in out if isinstance(q, str) and q))
 
 
 def _warnings(blocks: list[dict], answer: str) -> list[str]:
@@ -192,12 +244,20 @@ def _warnings(blocks: list[dict], answer: str) -> list[str]:
     all — which is the one failure that would otherwise look like a clean result.
     """
     out = []
+    for block in _search_results(blocks):
+        content = block.get("content") if "content" in block else block.get("output")
+        if isinstance(content, dict) and "error" in (content.get("type") or ""):
+            out.append(f"search error: {content.get('error_code') or 'unknown'}")
+        elif block.get("status") == "error":
+            # OpenAI's `failed` call becomes an `error` result with no code in the standard
+            # form, so it is reported in the words the raw form gets.
+            code = content.get("error_code") if isinstance(content, dict) else None
+            out.append(f"search error: {code}" if code else "search failed")
+        elif (status := (block.get("extras") or {}).get("status")) not in (None, "completed"):
+            # The standard form keeps a status other than completed or failed here.
+            out.append(f"search {status}")
     for block in blocks:
-        if block.get("type") == "web_search_tool_result":
-            content = block.get("content")
-            if isinstance(content, dict) and "error" in (content.get("type") or ""):
-                out.append(f"search error: {content.get('error_code') or 'unknown'}")
-        elif block.get("type") == "web_search_call":
+        if block.get("type") == "web_search_call":
             status = block.get("status")
             if status not in (None, "completed"):
                 out.append(f"search {status}")
@@ -205,7 +265,7 @@ def _warnings(blocks: list[dict], answer: str) -> list[str]:
     # queries today (Bedrock's GPT search verified 2026-09-25), but a call without them is
     # still a search, and calling that "unsourced" would tell the root to discard a sourced
     # answer.
-    ran = any(b.get("type") in ("web_search_call", "web_search_tool_result") for b in blocks)
+    ran = any(_is_search_call(b) for b in blocks) or bool(_search_results(blocks))
     if not (_searched(blocks) or ran):
         out.append("no search was performed; the answer is unsourced")
     if len(answer) > MAX_ANSWER_CHARS:

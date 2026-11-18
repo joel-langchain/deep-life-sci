@@ -16,6 +16,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from deep_life_sci.models import web_search_problem
 from deep_life_sci.sources import web
@@ -373,3 +374,153 @@ class TestWebSearchTool:
         result = await web_search.ainvoke({"query": "q"})
         assert len(result["answer"]) == MAX_ANSWER_CHARS
         assert any("truncated" in w for w in result["warnings"])
+
+
+def _standard(raw: list[dict], provider: str) -> list[dict]:
+    """The same turn in LangChain's standard block form, converted by langchain-core itself.
+
+    A deployment on 18 Nov 2026 returned this form, and parsing only the raw form there made
+    every successful search end with a "no search was performed" warning. Converting with
+    langchain-core rather than writing the blocks by hand keeps the tests on the real shape.
+    """
+    return AIMessage(content=raw, response_metadata={"model_provider": provider}).content_blocks
+
+
+_OPENAI_RAW = [
+    {
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "completed",
+        "action": {
+            "type": "search",
+            "query": "EMA lecanemab restrictions",
+            "sources": [{"type": "url", "url": "https://www.ema.europa.eu/search-hit"}],
+        },
+    },
+    {
+        "type": "web_search_call",
+        "id": "ws_2",
+        "status": "completed",
+        "action": {"type": "open_page", "url": "https://www.ema.europa.eu/leqembi"},
+    },
+    {
+        "type": "text",
+        "text": (
+            "Limited to non-carriers ([ema.europa.eu](https://www.ema.europa.eu/leqembi)). "
+            "MRI before set doses ([EPAR](https://www.ema.europa.eu/epar))."
+        ),
+        "annotations": [
+            {
+                "type": "url_citation",
+                "url": "https://www.ema.europa.eu/leqembi",
+                "title": "Leqembi",
+                "start_index": 0,
+                "end_index": 10,
+            }
+        ],
+    },
+]
+
+_ANTHROPIC_RAW = [
+    {
+        "type": "server_tool_use",
+        "id": "srvtoolu_1",
+        "name": "web_search",
+        "input": {"query": "EMA lecanemab restrictions"},
+    },
+    {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": [
+            {"type": "web_search_result", "url": "https://www.ema.europa.eu/a", "title": "A"},
+        ],
+    },
+    {
+        "type": "text",
+        "text": "Limited to non-carriers.",
+        "citations": [
+            {
+                "type": "web_search_result_location",
+                "url": "https://www.ema.europa.eu/a",
+                "title": "A",
+                "cited_text": "non-carriers",
+            }
+        ],
+    },
+]
+
+
+class TestStandardBlocks:
+    def test_openai_searches_and_opened_pages_are_read(self):
+        blocks = _standard(_OPENAI_RAW, "openai")
+        assert _searched(blocks) == [
+            "EMA lecanemab restrictions",
+            "https://www.ema.europa.eu/leqembi",
+        ]
+
+    def test_an_openai_search_that_ran_warns_about_nothing(self):
+        blocks = _standard(_OPENAI_RAW, "openai")
+        assert _warnings(blocks, _answer(blocks)) == []
+
+    def test_openai_sources_include_citations_and_inline_links(self):
+        blocks = _standard(_OPENAI_RAW, "openai")
+        assert _sources(blocks) == [
+            {"url": "https://www.ema.europa.eu/leqembi", "title": "Leqembi"},
+            {"url": "https://www.ema.europa.eu/epar", "title": "EPAR"},
+        ]
+
+    def test_an_uncited_openai_answer_falls_back_to_the_search_hits(self):
+        raw = [*_OPENAI_RAW[:2], {"type": "text", "text": "No links here."}]
+        blocks = _standard(raw, "openai")
+        assert _sources(blocks) == [{"url": "https://www.ema.europa.eu/search-hit", "title": ""}]
+
+    def test_a_failed_openai_call_is_reported(self):
+        raw = [{**_OPENAI_RAW[0], "status": "failed"}, {"type": "text", "text": "x"}]
+        assert "search failed" in _warnings(_standard(raw, "openai"), "x")
+
+    def test_anthropic_queries_citations_and_no_warning(self):
+        blocks = _standard(_ANTHROPIC_RAW, "anthropic")
+        assert _searched(blocks) == ["EMA lecanemab restrictions"]
+        assert _sources(blocks) == [{"url": "https://www.ema.europa.eu/a", "title": "A"}]
+        assert _warnings(blocks, _answer(blocks)) == []
+
+    def test_an_uncited_anthropic_answer_falls_back_to_the_search_results(self):
+        raw = [*_ANTHROPIC_RAW[:2], {"type": "text", "text": "No citations."}]
+        blocks = _standard(raw, "anthropic")
+        assert _sources(blocks) == [{"url": "https://www.ema.europa.eu/a", "title": "A"}]
+
+    def test_an_anthropic_error_result_is_reported_with_its_code(self):
+        raw = [
+            _ANTHROPIC_RAW[0],
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": {
+                    "type": "web_search_tool_result_error",
+                    "error_code": "max_uses_exceeded",
+                },
+            },
+        ]
+        warnings = _warnings(_standard(raw, "anthropic"), "x")
+        assert any("max_uses_exceeded" in w for w in warnings)
+
+    @pytest.mark.parametrize("provider", ["openai", "anthropic"])
+    def test_an_answer_from_memory_still_warns(self, provider: str):
+        blocks = _standard([{"type": "text", "text": "I recall that..."}], provider)
+        assert any("no search was performed" in w for w in _warnings(blocks, "x"))
+
+    async def test_the_tool_returns_a_clean_digest_for_standard_blocks(self, monkeypatch):
+        message = SimpleNamespace(content=_standard(_OPENAI_RAW, "openai"))
+
+        class Stub:
+            async def ainvoke(self, _prompt):
+                return message
+
+        monkeypatch.setattr(web, "web_search_model", lambda: Stub())
+        result = await web_search.ainvoke({"query": "what did the EMA restrict?"})
+        assert result["warnings"] == []
+        assert result["searched"] == [
+            "EMA lecanemab restrictions",
+            "https://www.ema.europa.eu/leqembi",
+        ]
+        assert len(result["sources"]) == 2
